@@ -16,7 +16,7 @@ class ResNetEncoder(nn.Module):
         self.layer1=layers[8]#[128 112 112]
         self.layer2=layers[9]#[256 56 56]
         self.layer3=layers[10]#[512 28 28]
-        self.layer4=layers[11]#[1024 14 14]
+       
        
       
 
@@ -46,7 +46,7 @@ class ResNetEncoder(nn.Module):
         x2 = self.layer2(x1)
         x3 = self.layer3(x2)
         
-        return torch.cat(local_features,dim=1)
+        return x2,x3
 
 
 class CLIPVisualEncoder(nn.Module):
