@@ -7,8 +7,8 @@ from .base_model import BaseModel
 from . import networks
 from .bfm import ParametricFaceModel
 from .losses import perceptual_loss, photo_loss, reg_loss, reflectance_loss, landmark_loss,ffLoss
-from .image_embedding_loss import ImageEmbddingLoss
-#from .VITCLIP import ImageEmbddingLoss
+#from .image_embedding_loss import ImageEmbddingLoss
+from .VITCLIP import ImageEmbddingLoss
 from util import util 
 from util.nvdiffrast import MeshRenderer
 from util.preprocess import estimate_norm_torch
