@@ -16,7 +16,7 @@ source activate face
 2. Install Nvdiffrast library:
 ```
 git clone https://github.com/NVlabs/nvdiffrast
-cd nvdiffrast    # ./Deep3DFaceRecon_pytorch/nvdiffrast
+cd nvdiffrast    # ./faceclip/nvdiffrast
 pip install .
 apt-get install freeglut3-dev
 apt-get install binutils-gold g++ cmake libglew-dev mesa-common-dev build-essential libglew1.5-dev libglm-dev
