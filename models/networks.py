@@ -10,6 +10,8 @@ from torch.optim import lr_scheduler
 import torch
 from torch import Tensor
 import torch.nn as nn
+import clip
+import torchvision.transforms as transforms
 try:
     from torch.hub import load_state_dict_from_url
 except ImportError:
@@ -17,7 +19,9 @@ except ImportError:
 from typing import Type, Any, Callable, Union, List, Optional
 from .arcface_torch.backbones import get_model
 from kornia.geometry import warp_affine
-
+from einops.layers.torch import Rearrange, Reduce
+from einops import rearrange
+from timm.models.layers import trunc_normal_, DropPath
 def resize_n_crop(image, M, dsize=112):
     # image: (b, c, h, w)
     # M   :  (b, 2, 3)
@@ -57,6 +61,334 @@ def get_scheduler(optimizer, opt):
         return NotImplementedError('learning rate policy [%s] is not implemented', opt.lr_policy)
     return scheduler
 
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    """
+    Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
+    the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
+    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
+    changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
+    'survival rate' as the argument.
+    """
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    output = x.div(keep_prob) * random_tensor
+    return output
+
+
+class DropPath(nn.Module):
+    """
+    Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+    """
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+
+class PatchEmbed(nn.Module):
+    """
+    2D Image to Patch Embedding
+    """
+    def __init__(self, img_size=224, patch_size=16, in_c=3, embed_dim=768, norm_layer=None):
+        super().__init__()
+        img_size = (img_size, img_size)
+        patch_size = (patch_size, patch_size)
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+
+        self.proj = nn.Conv2d(in_c, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert H == self.img_size[0] and W == self.img_size[1], \
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+
+        # flatten: [B, C, H, W] -> [B, C, HW]
+        # transpose: [B, C, HW] -> [B, HW, C]
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = self.norm(x)
+        return x
+
+
+class Attention(nn.Module):
+    def __init__(self,
+                 dim,   # 输入token的dim
+                 num_heads=8,
+                 qkv_bias=False,
+                 qk_scale=None,
+                 attn_drop_ratio=0.,
+                 proj_drop_ratio=0.):
+        super(Attention, self).__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop_ratio)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop_ratio)
+
+    def forward(self, x):
+        # [batch_size, num_patches + 1, total_embed_dim]
+        B, N, C = x.shape
+
+        # qkv(): -> [batch_size, num_patches + 1, 3 * total_embed_dim]
+        # reshape: -> [batch_size, num_patches + 1, 3, num_heads, embed_dim_per_head]
+        # permute: -> [3, batch_size, num_heads, num_patches + 1, embed_dim_per_head]
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        # [batch_size, num_heads, num_patches + 1, embed_dim_per_head]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        # transpose: -> [batch_size, num_heads, embed_dim_per_head, num_patches + 1]
+        # @: multiply -> [batch_size, num_heads, num_patches + 1, num_patches + 1]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        # @: multiply -> [batch_size, num_heads, num_patches + 1, embed_dim_per_head]
+        # transpose: -> [batch_size, num_patches + 1, num_heads, embed_dim_per_head]
+        # reshape: -> [batch_size, num_patches + 1, total_embed_dim]
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class Mlp(nn.Module):
+    """
+    MLP as used in Vision Transformer, MLP-Mixer and related networks
+    """
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class Blocks(nn.Module):
+    def __init__(self,
+                 dim,
+                 num_heads,
+                 mlp_ratio=4.,
+                 qkv_bias=False,
+                 qk_scale=None,
+                 drop_ratio=0.,
+                 attn_drop_ratio=0.,
+                 drop_path_ratio=0.,
+                 act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm):
+        super(Blocks, self).__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                              attn_drop_ratio=attn_drop_ratio, proj_drop_ratio=drop_ratio)
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path = DropPath(drop_path_ratio) if drop_path_ratio > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop_ratio)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+        
+class WMSA(nn.Module):
+    """ Self-attention module in Swin Transformer
+    """
+
+    def __init__(self, input_dim, output_dim, head_dim, window_size, type):
+        super(WMSA, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.head_dim = head_dim
+        self.scale = self.head_dim ** -0.5
+        self.n_heads = input_dim//head_dim
+        self.window_size = window_size
+        self.type=type
+        self.embedding_layer = nn.Linear(self.input_dim, 3*self.input_dim, bias=True)
+
+        # TODO recover
+        # self.relative_position_params = nn.Parameter(torch.zeros(self.n_heads, 2 * window_size - 1, 2 * window_size -1))
+        self.relative_position_params = nn.Parameter(torch.zeros((2 * window_size - 1)*(2 * window_size -1), self.n_heads))
+
+        self.linear = nn.Linear(self.input_dim, self.output_dim)
+
+        trunc_normal_(self.relative_position_params, std=.02)
+        self.relative_position_params = torch.nn.Parameter(self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).transpose(1,2).transpose(0,1))
+
+    def generate_mask(self, h, w, p, shift):
+        """ generating the mask of SW-MSA
+        Args:
+            shift: shift parameters in CyclicShift.
+        Returns:
+            attn_mask: should be (1 1 w p p),
+        """
+        # supporting sqaure.
+        attn_mask = torch.zeros(h, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
+        if self.type == 'W':
+            return attn_mask
+
+        s = p - shift
+        attn_mask[-1, :, :s, :, s:, :] = True
+        attn_mask[-1, :, s:, :, :s, :] = True
+        attn_mask[:, -1, :, :s, :, s:] = True
+        attn_mask[:, -1, :, s:, :, :s] = True
+        attn_mask = rearrange(attn_mask, 'w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)')
+        return attn_mask
+
+    def forward(self, x):
+        """ Forward pass of Window Multi-head Self-attention module.
+        Args:
+            x: input tensor with shape of [b h w c];
+            attn_mask: attention mask, fill -inf where the value is True;
+        Returns:
+            output: tensor shape [b h w c]
+        """
+        if self.type!='W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
+        x = rearrange(x, 'b (w1 p1) (w2 p2) c -> b w1 w2 p1 p2 c', p1=self.window_size, p2=self.window_size)
+        h_windows = x.size(1)
+        w_windows = x.size(2)
+        # sqaure validation
+        # assert h_windows == w_windows
+
+        x = rearrange(x, 'b w1 w2 p1 p2 c -> b (w1 w2) (p1 p2) c', p1=self.window_size, p2=self.window_size)
+        qkv = self.embedding_layer(x)
+        q, k, v = rearrange(qkv, 'b nw np (threeh c) -> threeh b nw np c', c=self.head_dim).chunk(3, dim=0)
+        sim = torch.einsum('hbwpc,hbwqc->hbwpq', q, k) * self.scale
+        # Adding learnable relative embedding
+        sim = sim + rearrange(self.relative_embedding(), 'h p q -> h 1 1 p q')
+        # Using Attn Mask to distinguish different subwindows.
+        if self.type != 'W':
+            attn_mask = self.generate_mask(h_windows, w_windows, self.window_size, shift=self.window_size//2)
+            sim = sim.masked_fill_(attn_mask, float("-inf"))
+
+        probs = nn.functional.softmax(sim, dim=-1)
+        output = torch.einsum('hbwij,hbwjc->hbwic', probs, v)
+        output = rearrange(output, 'h b w p c -> b w p (h c)')
+        output = self.linear(output)
+        output = rearrange(output, 'b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c', w1=h_windows, p1=self.window_size)
+
+        if self.type!='W': output = torch.roll(output, shifts=(self.window_size//2, self.window_size//2), dims=(1,2))
+        return output
+
+    def relative_embedding(self):
+        cord = torch.tensor(np.array([[i, j] for i in range(self.window_size) for j in range(self.window_size)]))
+        relation = cord[:, None, :] - cord[None, :, :] + self.window_size -1
+        # negative is allowed
+        return self.relative_position_params[:, relation[:,:,0].long(), relation[:,:,1].long()]
+
+
+class Block(nn.Module):
+    def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path, type='W', input_resolution=None):
+        """ SwinTransformer Block
+        """
+        super(Block, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        assert type in ['W', 'SW']
+        self.type = type
+        if input_resolution <= window_size:
+            self.type = 'W'
+
+        print("Block Initial Type: {}, drop_path_rate:{:.6f}".format(self.type, drop_path))
+        self.ln1 = nn.LayerNorm(input_dim)
+        self.msa = WMSA(input_dim, input_dim, head_dim, window_size, self.type)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.ln2 = nn.LayerNorm(input_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, 4 * input_dim),
+            nn.GELU(),
+            nn.Linear(4 * input_dim, output_dim),
+        )
+
+    def forward(self, x):
+        x = x + self.drop_path(self.msa(self.ln1(x)))
+        x = x + self.drop_path(self.mlp(self.ln2(x)))
+        return x
+class ConvTransBlock(nn.Module):
+    def __init__(self, conv_dim,trans_dim, head_dim, window_size, drop_path, type='W', input_resolution=None):
+        """ SwinTransformer and Conv Block
+        """
+        super(ConvTransBlock, self).__init__()
+        self.conv_dim = conv_dim
+        self.trans_dim = trans_dim
+        self.head_dim = head_dim
+        self.window_size = window_size
+        self.drop_path = drop_path
+        self.type = type
+        self.input_resolution = input_resolution
+
+        assert self.type in ['W', 'SW']
+        if self.input_resolution <= self.window_size:
+            self.type = 'W'
+
+        self.trans_block = Block(self.trans_dim, self.trans_dim, self.head_dim, self.window_size, self.drop_path, self.type, self.input_resolution)
+        self.conv1_1 = nn.Conv2d(self.conv_dim+self.trans_dim, self.conv_dim+self.trans_dim, 1, 1, 0, bias=True)
+        self.conv1_2 = nn.Conv2d(self.conv_dim+self.trans_dim, self.conv_dim+self.trans_dim, 1, 1, 0, bias=True)
+        self.conv_block = nn.Sequential(
+                #nn.GroupNorm(32,self.conv_dim),
+                #nn.BatchNorm2d(128),
+                nn.Conv2d(self.conv_dim, self.conv_dim, 3, 1, 1, bias=False),
+                nn.ReLU(True),
+                nn.Conv2d(self.conv_dim, self.conv_dim, 3, 1, 1, bias=False)
+                )
+
+    def forward(self, x):
+        conv_x, trans_x = torch.split(self.conv1_1(x), (self.conv_dim, self.trans_dim), dim=1)
+        
+        conv_x = self.conv_block(conv_x) + conv_x
+        trans_x = Rearrange('b c h w -> b h w c')(trans_x)
+        trans_x = self.trans_block(trans_x)
+        trans_x = Rearrange('b h w c -> b c h w')(trans_x)
+        res = self.conv1_2(torch.cat((conv_x, trans_x), dim=1))
+        x = x + res
+
+        return x
+
+class ConvBlock(nn.Module):
+    def __init__(self, conv_dim,):
+        """ SwinTransformer and Conv Block
+        """
+        super(ConvBlock, self).__init__()
+        self.conv_dim = conv_dim
+
+        self.conv1_1 = nn.Conv2d(self.conv_dim, 4*self.conv_dim, 1, 1, 0, bias=True)
+        self.conv1_2 = nn.Conv2d(4*self.conv_dim, self.conv_dim, 1, 1, 0, bias=True)
+        self.conv_block = nn.Sequential(
+                #nn.BatchNorm2d(4*self.conv_dim),
+                nn.Conv2d(4*self.conv_dim, 4*self.conv_dim, 3, 1, 1, bias=False),
+                nn.GELU(),#nn.ReLU(True),
+                nn.Conv2d(4*self.conv_dim, 4*self.conv_dim, 3, 1, 1, bias=False)
+                )
+
+    def forward(self, x):
+        conv_x=self.conv1_1(x)
+        conv_x = self.conv_block(conv_x) + conv_x
+        res = self.conv1_2(conv_x)
+        x=x+res
+
+        return x
+
 
 def define_net_recon(net_recon, use_last_fc=False, init_path=None):
     return ReconNetWrapper(net_recon, use_last_fc=use_last_fc, init_path=init_path)
@@ -80,28 +412,42 @@ class ReconNetWrapper(nn.Module):
             backbone.load_state_dict(state_dict)
             print("loading init net_recon %s from %s" %(net_recon, init_path))
         self.backbone = backbone
+        #self.conv = nn.Sequential(conv1x1(last_dim, 256))
+        self.conv = nn.Sequential(conv1x1(last_dim, 256))
+        #self.swinblock=nn.Sequential(ConvTransBlock(128,128,32,1,0,'W',1),ConvTransBlock(128,128,32,1,0,'W',1),ConvTransBlock(128,128,32,1,0,'W',1))
+        self.transformer=nn.Sequential(Blocks(256,32),Blocks(256,32),Blocks(256,32))
+        #self.conv_block = nn.Sequential(ConvBlock(256),ConvBlock(256),ConvBlock(256))
+        self.conv_block = ConvBlock(256)
+
         if not use_last_fc:
             self.final_layers = nn.ModuleList([
-                conv1x1(last_dim, 80, bias=True), # id layer
-                conv1x1(last_dim, 64, bias=True), # exp layer
-                conv1x1(last_dim, 80, bias=True), # tex layer
-                conv1x1(last_dim, 3, bias=True),  # angle layer
-                conv1x1(last_dim, 27, bias=True), # gamma layer
-                conv1x1(last_dim, 2, bias=True),  # tx, ty
-                conv1x1(last_dim, 1, bias=True)   # tz
+                conv1x1(512, 80, bias=True), # id layer
+                conv1x1(512, 64, bias=True), # exp layer
+                conv1x1(512, 80, bias=True), # tex layer
+                conv1x1(512, 3, bias=True),  # angle layer
+                conv1x1(512, 27, bias=True), # gamma layer
+                conv1x1(512, 2, bias=True),  # tx, ty
+                conv1x1(512, 1, bias=True)   # tz
             ])
             for m in self.final_layers:
                 nn.init.constant_(m.weight, 0.)
                 nn.init.constant_(m.bias, 0.)
 
-    def forward(self, x):
-        x = self.backbone(x)
+    def forward(self, img):
+        x = self.backbone(img)
+        x=self.conv(x)
+        b,c,h,w=x.size()
+        tx=x.flatten(2).transpose(1, 2)
+        tx = self.transformer(tx)
+        tx =tx.permute(0,2,1)[:,:,:,None]
+        cx=self.conv_block(x)
+        o=torch.cat([cx,tx],dim=1)
         if not self.use_last_fc:
             output = []
             for layer in self.final_layers:
-                output.append(layer(x))
-            x = torch.flatten(torch.cat(output, dim=1), 1)
-        return x
+               output.append(layer(o))
+            out = torch.flatten(torch.cat(output, dim=1), 1)
+        return out
 
 
 class RecogNetWrapper(nn.Module):
