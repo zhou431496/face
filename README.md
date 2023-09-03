@@ -7,7 +7,10 @@ Single Image  —— PyTorch implementation ##
 ## Installation
 1. Clone the repository and set up a conda environment with all dependencies as follows:
 ```
-
+git clone https://github.com/zhou431496/faceclip.git
+cd faceclip
+conda env create -f environment.yml
+source activate face
 ```
 
 2. Install Nvdiffrast library:
@@ -23,6 +26,14 @@ cd ..    # ./faceclip
 git clone https://github.com/deepinsight/insightface.git
 cp -r ./insightface/recognition/arcface_torch ./models/
 ```
+4. Install CLIP
+```
+git clone https://github.com/openai/CLIP.git
+```
+5. Install ffl_loss
+   ```
+   pip install focal-frequency-loss //https://github.com/EndlessSora/focal-frequency-loss
+   ```
 ## Inference with a pre-trained model
 
 ### Prepare prerequisite models
