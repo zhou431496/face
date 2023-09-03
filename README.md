@@ -18,6 +18,13 @@ source activate face
 git clone https://github.com/NVlabs/nvdiffrast
 cd nvdiffrast    # ./Deep3DFaceRecon_pytorch/nvdiffrast
 pip install .
+apt-get install freeglut3-dev
+apt-get install binutils-gold g++ cmake libglew-dev mesa-common-dev build-essential libglew1.5-dev libglm-dev
+apt-get install mesa-utils
+apt-get install libegl1-mesa-dev 
+apt-get install libgles2-mesa-dev
+apt-get install libnvidia-gl-525
+If there is a "[F glutil.cpp:338] eglInitialize() failed" error, you can try to change all the "dr.RasterizeGLContext" in util/nv_diffrast.py into "dr.RasterizeCudaContext".
 ```
 
 3. Install Arcface Pytorch:
@@ -31,9 +38,9 @@ cp -r ./insightface/recognition/arcface_torch ./models/
 git clone https://github.com/openai/CLIP.git
 ```
 5. Install ffl_loss
-   ```
-   pip install focal-frequency-loss //https://github.com/EndlessSora/focal-frequency-loss
-   ```
+```
+   pip install focal-frequency-loss   ####https://github.com/EndlessSora/focal-frequency-loss
+```
 
 
 
