@@ -6,13 +6,18 @@ import torch
 from .base_model import BaseModel
 from . import networks
 from .bfm import ParametricFaceModel
-from .losses import perceptual_loss, photo_loss, reg_loss, reflectance_loss, landmark_loss
+from .losses import perceptual_loss, photo_loss, reg_loss, reflectance_loss, landmark_loss,ffLoss
+from .image_embedding_loss import ImageEmbddingLoss
+#from .VITCLIP import ImageEmbddingLoss
 from util import util 
 from util.nvdiffrast import MeshRenderer
 from util.preprocess import estimate_norm_torch
 
 import trimesh
 from scipy.io import savemat
+
+#from .lossfunc import IDMRFLoss
+
 
 class FaceReconModel(BaseModel):
 
@@ -33,7 +38,6 @@ class FaceReconModel(BaseModel):
         parser.add_argument('--camera_d', type=float, default=10.)
         parser.add_argument('--z_near', type=float, default=5.)
         parser.add_argument('--z_far', type=float, default=15.)
-        parser.add_argument('--use_opengl', type=util.str2bool, nargs='?', const=True, default=True, help='use opengl context or not')
 
         if is_train:
             # training parameters
@@ -57,7 +61,9 @@ class FaceReconModel(BaseModel):
             parser.add_argument('--w_tex', type=float, default=1.7e-2, help='weight for tex_reg loss')
             parser.add_argument('--w_gamma', type=float, default=10.0, help='weight for gamma loss')
             parser.add_argument('--w_lm', type=float, default=1.6e-3, help='weight for lm loss')
-            parser.add_argument('--w_reflc', type=float, default=5.0, help='weight for reflc loss')
+            parser.add_argument('--w_ffl', type=float, default=5.0, help='weight for ffl loss')
+            parser.add_argument('--w_cl', type=float, default=2.0, help='weight for cl loss')
+            parser.add_argument('--w_vgg', type=float, default=1.0e-2, help='weight for vgg loss')
 
 
 
@@ -98,11 +104,12 @@ class FaceReconModel(BaseModel):
         
         fov = 2 * np.arctan(opt.center / opt.focal) * 180 / np.pi
         self.renderer = MeshRenderer(
-            rasterize_fov=fov, znear=opt.z_near, zfar=opt.z_far, rasterize_size=int(2 * opt.center), use_opengl=opt.use_opengl
+            rasterize_fov=fov, znear=opt.z_near, zfar=opt.z_far, rasterize_size=int(2 * opt.center)
         )
 
         if self.isTrain:
-            self.loss_names = ['all', 'feat', 'color', 'lm', 'reg', 'gamma', 'reflc']
+            #self.loss_names = ['all', 'feat', 'color', 'lm', 'reg','vgg']
+            self.loss_names = ['all', 'feat', 'color', 'lm', 'reg', 'cl', 'ffl']
 
             self.net_recog = networks.define_net_recog(
                 net_recog=opt.net_recog, pretrained_path=opt.net_recog_path
@@ -112,7 +119,9 @@ class FaceReconModel(BaseModel):
             self.comupte_color_loss = photo_loss
             self.compute_lm_loss = landmark_loss
             self.compute_reg_loss = reg_loss
-            self.compute_reflc_loss = reflectance_loss
+            self.compute_ffl_loss=ffLoss()
+            self.compute_cl_loss=ImageEmbddingLoss()
+            #self.compute_vgg_loss=IDMRFLoss()
 
             self.optimizer = torch.optim.Adam(self.net_recon.parameters(), lr=opt.lr)
             self.optimizers = [self.optimizer]
@@ -137,7 +146,7 @@ class FaceReconModel(BaseModel):
         self.pred_vertex, self.pred_tex, self.pred_color, self.pred_lm = \
             self.facemodel.compute_for_render(output_coeff)
         self.pred_mask, _, self.pred_face = self.renderer(
-            self.pred_vertex, self.facemodel.face_buf, feat=self.pred_color)
+            self.pred_vertex, self.facemodel.face_buf, feat=self.pred_color)#
         
         self.pred_coeffs_dict = self.facemodel.split_coeff(output_coeff)
 
@@ -161,6 +170,9 @@ class FaceReconModel(BaseModel):
         face_mask = face_mask.detach()
         self.loss_color = self.opt.w_color * self.comupte_color_loss(
             self.pred_face, self.input_img, self.atten_mask * face_mask)
+        self.loss_ffl=self.opt.w_ffl*self.compute_ffl_loss(self.pred_face*(self.atten_mask * face_mask),self.input_img*(self.atten_mask * face_mask))
+        self.loss_cl =self.opt.w_cl* self.compute_cl_loss(self.pred_face*(self.atten_mask * face_mask),self.input_img*(self.atten_mask * face_mask))
+        #self.loss_vgg=self.opt.w_vgg*self.compute_vgg_loss(self.pred_face*(self.atten_mask * face_mask),self.input_img*(self.atten_mask * face_mask))
         
         loss_reg, loss_gamma = self.compute_reg_loss(self.pred_coeffs_dict, self.opt)
         self.loss_reg = self.opt.w_reg * loss_reg
@@ -168,10 +180,12 @@ class FaceReconModel(BaseModel):
 
         self.loss_lm = self.opt.w_lm * self.compute_lm_loss(self.pred_lm, self.gt_lm)
 
-        self.loss_reflc = self.opt.w_reflc * self.compute_reflc_loss(self.pred_tex, self.facemodel.skin_mask)
+        #self.loss_reflc = self.opt.w_reflc * self.compute_reflc_loss(self.pred_tex, self.facemodel.skin_mask)
 
-        self.loss_all = self.loss_feat + self.loss_color + self.loss_reg + self.loss_gamma \
-                        + self.loss_lm + self.loss_reflc
+        #self.loss_all = self.loss_feat + self.loss_color + self.loss_reg  \
+         #               + self.loss_lm + self.loss_vgg
+        self.loss_all = self.loss_feat + self.loss_color + self.loss_reg \
+                        + self.loss_lm + self.loss_ffl+self.loss_cl
             
 
     def optimize_parameters(self, isTrain=True):
@@ -213,7 +227,7 @@ class FaceReconModel(BaseModel):
         recon_color = self.pred_color
         recon_color = recon_color.cpu().numpy()[0]
         tri = self.facemodel.face_buf.cpu().numpy()
-        mesh = trimesh.Trimesh(vertices=recon_shape, faces=tri, vertex_colors=np.clip(255. * recon_color, 0, 255).astype(np.uint8), process=False)
+        mesh = trimesh.Trimesh(vertices=recon_shape, faces=tri, vertex_colors=np.clip(255. * recon_color, 0, 255).astype(np.uint8),process=False)
         mesh.export(name)
 
     def save_coeff(self,name):
